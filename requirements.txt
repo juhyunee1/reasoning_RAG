@@ -1,0 +1,19 @@
+# 核心依赖
+openai>=1.0.0+
+python-dotenv>=1.0.0
+
+# 向量数据库
+chromadb>=0.4.0
+
+# 数据处理
+numpy>=1.24.0
+pandas>=2.0.0
+tqdm>=4.65.0
+
+# 工具
+pydantic>=2.0.0
+
+# 前端
+gradio == 5.49.1
+mdtex2html
+
