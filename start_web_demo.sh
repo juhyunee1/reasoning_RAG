@@ -31,7 +31,7 @@ echo "=================================="
 
 # 启动 Demo
 python web_demo.py \
-    --server-port 7201 \
+    --server-port 7860 \
     --server-name 0.0.0.0 \
     "$@"
 

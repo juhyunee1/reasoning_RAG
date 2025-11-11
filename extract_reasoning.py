@@ -6,7 +6,7 @@
 import json
 import uuid
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from openai import OpenAI
 from datetime import datetime
 from tqdm import tqdm
@@ -25,60 +25,90 @@ class DirectReasoningExtractor:
         )
         
         # 关键章节（用于提取推理链）
-        # 注意：Nature Neuroscience的Introduction章节叫做"Main"
         self.key_sections = ['abstract', 'introduction', 'main', 'results', 'discussion', 'conclusion', 'methods']
     
     def load_metadata(self, metadata_file: Path) -> Dict[str, Dict]:
-        """加载所有论文的元数据"""
+        """
+        加载所有论文的元数据
+        
+        同时通过 id 和 doi 建立索引，支持双重匹配
+        """
         print("加载元数据...")
         metadata_dict = {}
+        metadata_dict_by_doi = {}
         
         with open(metadata_file, 'r', encoding='utf-8') as f:
             for line in tqdm(f, desc="读取metadata"):
                 if line.strip():
                     meta = json.loads(line)
-                    metadata_dict[meta['id']] = meta
+                    # 通过 id 索引
+                    if 'id' in meta:
+                        metadata_dict[meta['id']] = meta
+                    # 通过 doi 索引（作为备选）
+                    if 'doi' in meta and meta['doi']:
+                        metadata_dict_by_doi[meta['doi']] = meta
         
         print(f"✓ 加载了 {len(metadata_dict)} 篇论文的元数据")
-        return metadata_dict
+        print(f"✓ 其中 {len(metadata_dict_by_doi)} 篇有 DOI 信息")
+        
+        # 返回双重索引字典
+        return {
+            'by_id': metadata_dict,
+            'by_doi': metadata_dict_by_doi
+        }
     
     def load_media(self, media_file: Path) -> Dict[str, List]:
         """
         加载所有论文的媒体数据（figures, tables等）
         
         注意：media.jsonl中每一行是一个图表，同一篇论文有多行
-        需要按paper_id聚合
+        需要按paper_id或doi聚合，支持双重匹配
         """
         print("加载媒体数据...")
-        media_dict = {}
+        media_dict_by_id = {}
+        media_dict_by_doi = {}
         
         with open(media_file, 'r', encoding='utf-8') as f:
             for line in tqdm(f, desc="读取media"):
                 if line.strip():
                     media_item = json.loads(line)
-                    paper_id = media_item.get('id')
                     
+                    # 提取关键信息
+                    media_info = {
+                        'type': media_item.get('type'),
+                        'label': media_item.get('label'),
+                        'caption': media_item.get('caption'),
+                        'legend': media_item.get('legend'),
+                        'name': media_item.get('name')
+                    }
+                    
+                    # 通过 id 索引
+                    paper_id = media_item.get('id')
                     if paper_id:
-                        # 将每个media item添加到对应paper的列表中
-                        if paper_id not in media_dict:
-                            media_dict[paper_id] = []
-                        
-                        # 提取关键信息
-                        media_dict[paper_id].append({
-                            'type': media_item.get('type'),
-                            'label': media_item.get('label'),
-                            'caption': media_item.get('caption'),
-                            'legend': media_item.get('legend'),
-                            'name': media_item.get('name')
-                        })
+                        if paper_id not in media_dict_by_id:
+                            media_dict_by_id[paper_id] = []
+                        media_dict_by_id[paper_id].append(media_info)
+                    
+                    # 通过 doi 索引（作为备选）
+                    paper_doi = media_item.get('doi')
+                    if paper_doi:
+                        if paper_doi not in media_dict_by_doi:
+                            media_dict_by_doi[paper_doi] = []
+                        media_dict_by_doi[paper_doi].append(media_info)
         
-        print(f"✓ 加载了 {len(media_dict)} 篇论文的媒体数据")
+        total_papers_by_id = len(media_dict_by_id)
+        total_papers_by_doi = len(media_dict_by_doi)
+        total_media = sum(len(items) for items in media_dict_by_id.values())
         
-        # 统计信息
-        total_media = sum(len(items) for items in media_dict.values())
+        print(f"✓ 通过 ID 索引: {total_papers_by_id} 篇论文")
+        print(f"✓ 通过 DOI 索引: {total_papers_by_doi} 篇论文")
         print(f"✓ 总计 {total_media} 个图表")
         
-        return media_dict
+        # 返回双重索引字典
+        return {
+            'by_id': media_dict_by_id,
+            'by_doi': media_dict_by_doi
+        }
     
     def parse_contents_file(self, contents_file: Path, max_papers: int = None) -> List[Dict]:
         """
@@ -164,53 +194,63 @@ class DirectReasoningExtractor:
         print(f"✓ 成功解析 {len(papers)} 篇论文")
         return papers
     
-    def extract_key_content(self, paper_content: Dict, media_data: List = None, max_total_chars: int = 20000) -> str:
+    def extract_key_content(self, paper_content: Dict, media_data: List = None, max_total_chars: int = None, is_review: bool = False) -> str:
         """
-        智能提取论文的关键内容用于推理链分析
+        提取论文的完整关键内容用于推理链分析
         
         策略：
-        1. 按章节优先级分配字符配额
-        2. Figures插入到Methods和Results之间
-        3. 保证Results和Discussion不被截断
+        - 研究论文模式：提取所有关键章节的完整内容（introduction, main, methods, results, discussion, conclusion）
+        - 综述模式：保留所有正文内容，排除References、Rights And Permissions、Author Information等部分
         
         Args:
             paper_content: 论文内容
             media_data: 媒体数据（figures, tables等）
-            max_total_chars: 最大字符数限制
-            
+            max_total_chars: 最大字符数（暂未使用）
+            is_review: 是否是综述论文（默认False）
         Returns:
-            关键内容的文本
+            关键内容的完整文本
         """
-        # 字符配额分配（确保关键章节不被截断）
-        char_quotas = {
-            'introduction': 3000,  # Introduction完整保留
-            'main': 3000,          # Nature Neuroscience的Introduction
-            'methods': 10000,       # Methods核心部分
-            'results': 10000,       # Results完整保留
-            'discussion': 6000     # Discussion完整保留
-        }
+        sections_list = paper_content.get('sections', [])
         
-        # 分别提取各章节内容
-        sections_dict = {}
-        
-        for section in paper_content.get('sections', []):
-            section_title = section.get('section_title', '')
-            section_title_lower = section_title.lower()
-            section_texts = section.get('section_text', [])
+        # 综述模式：保留所有正文内容，排除不需要的章节
+        if is_review:
+            # 需要排除的章节关键词
+            exclude_keywords = [
+                'references', 'reference',
+                'rights and permissions', 'rights & permissions',
+                'author information', 'author contributions', 'authors',
+                'acknowledgments', 'acknowledgement',
+                'supplementary', 'supplemental',
+                'data availability', 'code availability',
+                'competing interests', 'conflict of interest',
+                'ethics', 'ethical',
+                'peer review', 'reviewer',
+                'publisher', 'copyright',
+                'about this article', 'about the article',
+                'article history', 'publication history'
+            ]
             
-            # 检查是否是关键章节
-            matched_key = None
-            for key in char_quotas.keys():
-                if key in section_title_lower:
-                    matched_key = key
-                    break
+            final_parts = []
             
-            if matched_key:
-                section_content = []
-                char_count = 0
-                quota = char_quotas[matched_key]
+            # 遍历所有章节，排除不需要的章节
+            for section in sections_list:
+                section_title = section.get('section_title', '')
+                section_title_lower = section_title.lower()
                 
-                # 提取内容直到达到配额
+                # 检查是否需要排除
+                should_exclude = False
+                for keyword in exclude_keywords:
+                    if keyword in section_title_lower:
+                        should_exclude = True
+                        break
+                
+                if should_exclude:
+                    continue
+                
+                # 提取章节内容
+                section_texts = section.get('section_text', [])
+                section_content = []
+                
                 for text_item in section_texts:
                     if isinstance(text_item, dict):
                         text = text_item.get('content', '')
@@ -219,17 +259,112 @@ class DirectReasoningExtractor:
                     
                     text = text.strip()
                     if text:
-                        # 检查是否超过配额
-                        if char_count + len(text) > quota:
-                            # 如果是Results或Discussion，强制包含
-                            if matched_key in ['results', 'discussion']:
-                                section_content.append(text)
-                                char_count += len(text)
-                            else:
-                                break
-                        else:
-                            section_content.append(text)
-                            char_count += len(text)
+                        section_content.append(text)
+                
+                if section_content:
+                    final_parts.append(f"\n## {section_title}:\n" + "\n".join(section_content))
+            
+            # 添加图表信息
+            if media_data:
+                figure_captions = []
+                for media_item in media_data:
+                    media_type = media_item.get('type', '').lower()
+                    caption = media_item.get('caption', '')
+                    legend = media_item.get('legend', '')
+                    name = media_item.get('name', '')
+                    
+                    if caption or legend or name:
+                        caption_text = f"{media_type.upper()}: "
+                        if name:
+                            caption_text += f"{name}. "
+                        if caption:
+                            caption_text += caption
+                        if legend:
+                            caption_text += f" [Legend: {legend}]"
+                        figure_captions.append(caption_text.strip())
+                
+                if figure_captions:
+                    final_parts.append(f"\n## Figures and Tables:\n" + "\n".join(figure_captions))
+            
+            return "\n".join(final_parts)
+        
+        # 研究论文模式：提取关键章节
+        # 关键章节列表
+        key_section_keys = ['introduction', 'main', 'methods', 'results', 'discussion', 'conclusion']
+        
+        # 不同期刊的章节命名规范：
+        # - nature: Abstract, Main, Discussion, Methods, 无 Results
+        # - nature neuroscience: Abstract, Main, Results, Discussion, Methods
+        # - nature communication: Abstract, Introduction, Results, Discussion, Methods 
+        # - neuron: Summary, Keywords, Introduction, Results, Discussion, Experimental Procedures
+        # - cell: Summary, Kerwords, Introduction, Results, Discussion, Experimental Procedures
+        # - nature reviews neuroscience: Abstract, Main, Results, Discussion, Methods
+        # - science: Abstract, No Results, Discussion
+        
+        # Methods 章节的各种命名（需要特别处理）
+        methods_keywords = ['methods', 'method', 'experimental procedures', 'experimental procedure', 
+                           'materials and methods', 'materials & methods', 'procedures']
+        
+        sections_dict = {}
+        
+        # 特殊处理：Nature 期刊没有 Results 标题，而是用 Main 和 Discussion 之间的章节作为 Results
+        # 先找出 Main 和 Discussion 的位置
+        main_idx = None
+        discussion_idx = None
+        
+        for idx, section in enumerate(sections_list):
+            section_title = section.get('section_title', '')
+            section_title_lower = section_title.lower()
+            
+            # 识别 Main（注意：Main 标题通常很短，避免误匹配包含"main"的其他标题）
+            if 'main' in section_title_lower and len(section_title) < 20:
+                main_idx = idx
+            # 识别 Discussion
+            if 'discussion' in section_title_lower:
+                discussion_idx = idx
+        
+        # 提取 Main 和 Discussion 之间的章节作为 Results（仅当两者都存在且之间有章节时）
+        nature_results_sections = []
+        if main_idx is not None and discussion_idx is not None and discussion_idx > main_idx + 1:
+            for idx in range(main_idx + 1, discussion_idx):
+                nature_results_sections.append(idx)
+        
+        # 遍历所有章节进行匹配
+        for idx, section in enumerate(sections_list):
+            section_title = section.get('section_title', '')
+            section_title_lower = section_title.lower()
+            section_texts = section.get('section_text', [])
+            
+            # 检查是否是关键章节
+            matched_key = None
+            
+            # 特殊处理 1: 如果是 Nature 的 Results 章节（Main 和 Discussion 之间）
+            if idx in nature_results_sections:
+                matched_key = 'results'
+            # 特殊处理 2: 先检查是否是 Methods 相关章节
+            # Neuron 使用 "Experimental Procedures"，需要匹配到 methods
+            elif any(keyword in section_title_lower for keyword in methods_keywords):
+                matched_key = 'methods'
+            # 特殊处理 3: 其他章节的匹配
+            else:
+                for key in key_section_keys:
+                    if key in section_title_lower:
+                        matched_key = key
+                        break
+            
+            if matched_key:
+                section_content = []
+                
+                # 完整提取所有内容，不截断
+                for text_item in section_texts:
+                    if isinstance(text_item, dict):
+                        text = text_item.get('content', '')
+                    else:
+                        text = str(text_item)
+                    
+                    text = text.strip()
+                    if text:
+                        section_content.append(text)
                 
                 if section_content:
                     # 根据章节类型添加标记
@@ -244,13 +379,21 @@ class DirectReasoningExtractor:
                     else:
                         label = ""
                     
-                    sections_dict[matched_key] = f"\n## {section_title} {label}:\n" + "\n".join(section_content)
+                    # 对于 Results，如果已有内容，则追加（Nature 期刊可能有多个 Results 章节）
+                    if matched_key == 'results' and matched_key in sections_dict:
+                        # 追加到已有的 Results 内容
+                        existing_content = sections_dict[matched_key]
+                        new_content = f"\n## {section_title}:\n" + "\n".join(section_content)
+                        sections_dict[matched_key] = existing_content + "\n" + new_content
+                    else:
+                        sections_dict[matched_key] = f"\n## {section_title} {label}:\n" + "\n".join(section_content)
         
-        # 提取Figures和Tables的captions
+        # 提取Figures和Tables的captions（完整提取，无数量限制）
         figures_content = ""
         if media_data:
             figure_captions = []
-            for media_item in media_data[:15]:  # 最多提取15个图表
+            # 提取所有图表，不再限制数量
+            for media_item in media_data:
                 media_type = media_item.get('type', '').lower()
                 caption = media_item.get('caption', '')
                 legend = media_item.get('legend', '')
@@ -303,28 +446,28 @@ Paper Title
 {paper_title}
 
 Key Content from Paper
-{key_content[:30000]}  
+{key_content}  
 
 Your Task
 Extract the CORE reasoning logic in 4 CONCISE PARAGRAPHS. Focus on the ESSENCE, not details.
 
 1. problem_decomposition: Core Research Question and Its Logical Breakdown
-Read the Introduction/Main section strategically (early → middle → late paragraphs) and write ONE CONCISE PARAGRAPH (3-5 sentences) that captures:
+Read the Introduction/Main section strategically (early → middle → late paragraphs) and write ONE CONCISE PARAGRAPH  that captures:
 - Early paragraphs: The broad background context and macroscopic problem
 - Middle paragraphs: The mechanistic/phenotypic gap or unresolved question
 - Late paragraphs: The specific hypothesis or core research question this paper addresses
 Synthesize these three layers into a coherent logical flow: background → gap → hypothesis.
 
 2. data: Data Sources and Requirements
-Read the Methods section and Figure/Table captions and write ONE CONCISE PARAGRAPH (3-4 sentences) describing what data this research depends on. Include:
+Read the Methods section and Figure/Table captions and write ONE CONCISE PARAGRAPH  describing what data this research depends on. Include:
 - Sample source: What subjects/models were used (species, age, strain, sample size)
 - Data type: What was measured (neural recordings, behavior, imaging, molecular data)
 - Sampling characteristics: Recording methods, temporal/spatial resolution, duration and brain regions
-- Task conditions: What behavioral paradigms or experimental manipulations were applied
+- Task conditions: What behavioral paradigms or experimental manipulations were applied, describe the structure of the behavior task(most important part)
 Use natural, flowing language to describe the data foundation of this study.
 
 3. method: Experimental Design and Data Acquisition Methods
-Read the Methods, Figure captions, and Results sections and write ONE CONCISE PARAGRAPH (4-5 sentences) describing HOW the required data were obtained. Include:
+Read the Methods, Figure captions, and Results sections and write ONE CONCISE PARAGRAPH  describing HOW the required data were obtained. Include:
 - Experimental design: Control vs. experimental groups, within/between-subject design, sample size rationale
 - Data acquisition methods: Specific techniques and instruments used to collect each data type (e.g., recording setup, behavioral tracking, imaging parameters)
 - Experimental conditions: Manipulated variables, control conditions, timing/sequence of interventions
@@ -332,10 +475,9 @@ Read the Methods, Figure captions, and Results sections and write ONE CONCISE PA
 Focus on the DESIGN LOGIC: what methods were chosen to obtain what data, and how the experimental design allows testing the hypothesis.
 
 4. conclusion: Key Findings, Answer, and Significance
-Read the Results and Discussion sections and write ONE CONCISE PARAGRAPH (4-6 sentences) that:
-- Summarizes 2-3 main empirical findings
-- States how these findings answer the core question
-- Explains the broader scientific significance
+Read the Results and Discussion sections and write ONE CONCISE PARAGRAPH that:
+- States how these experiments and data analysis results lead to the findings
+- Summarizes the logical chain: Data -> Method -> Conclusion -> Scientific findings(most important part)
 
 Critical Instructions:
 - In Nature Neuroscience papers, the "Main" section IS the Introduction
@@ -364,7 +506,70 @@ Return ONLY the JSON object with 4 fields, no additional text.
 """
         return prompt
     
-    def extract_reasoning_chain(self, paper_content: Dict, metadata: Dict, media_data: List = None) -> Optional[Dict]:
+    def build_survey_prompt(self, paper_title: str, key_content: str) -> str:
+        """构建综述论文的推理链提取prompt"""
+        prompt = f"""You are an expert in scientific reasoning and research methodology in neuroscience. Your task is to extract the CORE SCIENTIFIC REASONING CHAIN from this REVIEW/SURVEY paper in a CONCISE, STREAMLINED format.
+
+Paper Title
+{paper_title}
+
+Key Content from Paper
+{key_content}  
+
+Your Task
+Extract the CORE reasoning logic in 4 CONCISE PARAGRAPHS. Focus on the ESSENCE of how the review synthesizes the field, not details.
+
+1. problem_decomposition: Field Problem Landscape and Key Questions
+Read the Abstract and Introduction strategically (early → mid → late paragraphs) and write ONE CONCISE PARAGRAPH that captures:
+- Early paragraphs: Broad neuroscientific context and overarching domain question
+- Middle paragraphs: Key mechanistic unknowns, theoretical debates, or unresolved gaps
+- Late paragraphs: Specific sub-questions or frameworks the review is organized around
+Focus on the problem landscape of the field, not a single experimental hypothesis.
+
+2. evidence: Empirical Foundation Integrated by the Review
+Read early-to-mid Main and figure captions focusing on empirical studies and write ONE CONCISE PARAGRAPH describing the empirical foundation this review integrates:
+- Species/systems studied (human, rodent, primate, cell prep, computational models, etc.)
+- Key data modalities (electrophysiology, imaging, behavior, genetics, computational modeling, clinical studies)
+- Major experimental paradigms and brain regions represented
+- Cross-scale linkage (molecular → circuit → systems → behavior)
+Emphasize what empirical sources the field uses, not specific datasets from this paper.
+
+3. framework: Knowledge Organization and Synthesis Strategy
+Read late Main, figure captions, and Discussion and write ONE CONCISE PARAGRAPH describing how the review organizes and synthesizes knowledge:
+- Theoretical or mechanistic frameworks compared or integrated
+- Competing/alternative models and how the review reconciles them
+- Cross-study synthesis strategy (causal chain, computation-to-circuit mapping, cross-species convergence, etc.)
+- Key conceptual diagrams, schemas, or explanatory mechanisms emphasized
+Focus on the logic that structures the field and how the review creates coherence across diverse findings.
+
+4. conclusion: Field Consensus, Gaps, and Future Directions
+Read the Conclusion / Discussion and write ONE PARAGRAPH that:
+- States current consensus or leading mechanistic view(s)
+- Summarizes major open questions and controversies
+- Identifies methodological or conceptual limitations
+- Highlights future research directions or proposed experimental/theoretical roadmaps
+Summarize the logical path: evidence → synthesis → field status → what's next
+
+Critical Instructions:
+- This is a REVIEW/SURVEY paper, focus on field-level synthesis, not single experiments
+- Each field should be ONE CONCISE PARAGRAPH (not lists, not multiple paragraphs)
+- Focus on CORE REASONING LOGIC and field-level insights
+- Write in natural, flowing language suitable for embedding models
+- Output in English
+
+Output Format (JSON):
+{{
+    "problem_decomposition": "...",
+    "evidence": "...",
+    "framework": "...",
+    "conclusion": "..."
+}}
+
+Return ONLY the JSON object with 4 fields, no additional text.
+"""
+        return prompt
+    
+    def extract_reasoning_chain(self, paper_content: Dict, metadata: Dict, media_data: List = None, is_review: bool = False) -> Optional[Dict]:
         """
         从单篇论文直接提取推理链
         
@@ -372,6 +577,7 @@ Return ONLY the JSON object with 4 fields, no additional text.
             paper_content: 论文内容
             metadata: 论文元数据
             media_data: 媒体数据（figures, tables等）
+            is_review: 是否使用综述提取模式（默认False，使用研究论文模式）
             
         Returns:
             推理链数据（包含research_reasoning）
@@ -379,14 +585,23 @@ Return ONLY the JSON object with 4 fields, no additional text.
         paper_title = paper_content.get('title', 'Unknown')
         
         # 提取关键内容（包括media captions）
-        key_content = self.extract_key_content(paper_content, media_data)
+        key_content = self.extract_key_content(paper_content, media_data, is_review=is_review)
+                
+        # 显示内容长度信息（用于监控）
+        content_length_k = len(key_content) / 1000
+        print(f"  📄 内容长度: {content_length_k:.1f}K 字符")
         
-        if not key_content or len(key_content) < 200:
-            print(f"  ✗ 内容太少，跳过")
-            return None
-        
-        # 构建Prompt
-        prompt = self.build_reasoning_prompt(paper_title, key_content)
+        # 根据参数选择提取模式
+        if is_review:
+            print(f"  📚 使用综述提取模式")
+            # 构建综述Prompt
+            prompt = self.build_survey_prompt(paper_title, key_content)
+            required_fields = ['problem_decomposition', 'evidence', 'framework', 'conclusion']
+        else:
+            print(f"  🔬 使用研究论文提取模式")
+            # 构建研究论文Prompt
+            prompt = self.build_reasoning_prompt(paper_title, key_content)
+            required_fields = ['problem_decomposition', 'data', 'method', 'conclusion']
         
         # 调用LLM提取推理链
         max_retries = 3
@@ -411,7 +626,6 @@ Return ONLY the JSON object with 4 fields, no additional text.
                 reasoning = json.loads(response.choices[0].message.content)
                 
                 # 验证必要字段
-                required_fields = ['problem_decomposition', 'data', 'method', 'conclusion']
                 if not all(field in reasoning for field in required_fields):
                     raise ValueError(f"Missing required fields in LLM response")
                 
@@ -429,10 +643,18 @@ Return ONLY the JSON object with 4 fields, no additional text.
                     
                     # 核心推理链（精炼的段落格式）
                     "problem_decomposition": reasoning['problem_decomposition'],
-                    "data": reasoning['data'],
-                    "method": reasoning['method'],
                     "conclusion": reasoning['conclusion']
                 }
+                
+                # 根据论文类型添加不同的字段
+                if is_review:
+                    # 综述论文：使用 evidence 和 framework
+                    result["evidence"] = reasoning['evidence']
+                    result["framework"] = reasoning['framework']
+                else:
+                    # 研究论文：使用 data 和 method
+                    result["data"] = reasoning['data']
+                    result["method"] = reasoning['method']
                 
                 return result
                 
@@ -442,6 +664,48 @@ Return ONLY the JSON object with 4 fields, no additional text.
                     return None
         
         return None
+    
+    def _match_paper_data(
+        self,
+        paper: Dict,
+        metadata_dict: Dict,
+        media_dict: Dict
+    ) -> Tuple[Dict, List]:
+        """
+        匹配论文的元数据和媒体数据
+        
+        优先使用 id 匹配，如果失败则使用 doi 匹配
+        
+        Args:
+            paper: 论文内容字典
+            metadata_dict: 元数据字典（包含 by_id 和 by_doi）
+            media_dict: 媒体数据字典（包含 by_id 和 by_doi）
+            
+        Returns:
+            (metadata, media_data) 元组
+        """
+        paper_id = paper.get('id')
+        paper_doi = paper.get('doi')
+        
+        # 优先通过 id 匹配元数据
+        metadata = {}
+        if paper_id and 'by_id' in metadata_dict:
+            metadata = metadata_dict['by_id'].get(paper_id, {})
+        
+        # 如果 id 匹配失败，尝试通过 doi 匹配
+        if not metadata and paper_doi and 'by_doi' in metadata_dict:
+            metadata = metadata_dict['by_doi'].get(paper_doi, {})
+        
+        # 优先通过 id 匹配媒体数据
+        media_data = []
+        if paper_id and 'by_id' in media_dict:
+            media_data = media_dict['by_id'].get(paper_id, [])
+        
+        # 如果 id 匹配失败，尝试通过 doi 匹配
+        if not media_data and paper_doi and 'by_doi' in media_dict:
+            media_data = media_dict['by_doi'].get(paper_doi, [])
+        
+        return metadata, media_data
     
     def _load_processed_papers(self, output_file: Path) -> set:
         """
@@ -501,7 +765,8 @@ Return ONLY the JSON object with 4 fields, no additional text.
         data_dir: Path,
         output_file: Path,
         max_papers: int = None,
-        resume: bool = True
+        resume: bool = True,
+        is_review: bool = False
     ):
         """
         批量处理论文（支持断点续传）
@@ -511,6 +776,7 @@ Return ONLY the JSON object with 4 fields, no additional text.
             output_file: 输出文件（reasoning_chains.jsonl）
             max_papers: 最多处理多少篇
             resume: 是否启用断点续传（默认True）
+            is_review: 是否使用综述提取模式（默认False，使用研究论文模式）
         """
         data_dir = Path(data_dir)
         output_file = Path(output_file)
@@ -518,6 +784,11 @@ Return ONLY the JSON object with 4 fields, no additional text.
         
         print("=" * 80)
         print("🧠 提取科研推理链（支持断点续传）")
+        print("=" * 80)
+        if is_review:
+            print("📚 模式: 综述提取模式")
+        else:
+            print("🔬 模式: 研究论文提取模式")
         print("=" * 80)
         
         # 检查断点续传
@@ -538,6 +809,7 @@ Return ONLY the JSON object with 4 fields, no additional text.
             media_dict = self.load_media(media_file)
         else:
             print("⚠ 警告: 未找到media.jsonl，将不提取图表信息")
+            media_dict = {'by_id': {}, 'by_doi': {}}
         
         # 解析contents
         papers = self.parse_contents_file(
@@ -573,15 +845,20 @@ Return ONLY the JSON object with 4 fields, no additional text.
             try:
                 paper_id = paper.get('id')
                 paper_title = paper.get('title', 'Unknown')
-                metadata = metadata_dict.get(paper_id, {})
-                media_data = media_dict.get(paper_id, [])
+                
+                # 使用双重匹配获取元数据和媒体数据
+                metadata, media_data = self._match_paper_data(
+                    paper, metadata_dict, media_dict
+                )
                 
                 print(f"\n处理: {paper_title[:60]}...")
+                if not metadata:
+                    print(f"  ⚠ 警告: 未找到匹配的元数据 (ID: {paper_id})")
                 if media_data:
                     print(f"  找到 {len(media_data)} 个图表")
                 
                 # 提取推理链
-                result = self.extract_reasoning_chain(paper, metadata, media_data)
+                result = self.extract_reasoning_chain(paper, metadata, media_data, is_review=is_review)
                 
                 if result:
                     # 立即保存（增量写入）
@@ -703,13 +980,13 @@ def main():
     parser.add_argument(
         "--data-dir",
         type=str,
-        default="./nature_neuroscience",
+        default="./data/annual_review",
         help="数据目录"
     )
     parser.add_argument(
         "--output",
         type=str,
-        default="./data/reasoning_chains.jsonl",
+        default="./data/annual_review/reasoning_chains.jsonl",
         help="输出文件"
     )
     parser.add_argument(
@@ -727,8 +1004,13 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default=config.OPENAI_MODEL,
+        default=config.EXTRACTION_MODEL,
         help="模型名称"
+    )
+    parser.add_argument(
+        "--is-review",
+        action="store_true",
+        help="使用综述提取模式（默认False，使用研究论文模式）"
     )
     
     args = parser.parse_args()
@@ -745,10 +1027,9 @@ def main():
     extractor.batch_process(
         data_dir=args.data_dir,
         output_file=args.output,
-        max_papers=max_papers
+        max_papers=max_papers,
+        is_review=args.is_review
     )
-
 
 if __name__ == "__main__":
     main()
-

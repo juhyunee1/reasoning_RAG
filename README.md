@@ -32,7 +32,7 @@ OPENAI_API_KEY = "your_qwen_api_key"
 ### 3. 构建数据库（首次使用）
 
 ```bash
-python build_hybrid_reasoning_db.py
+python3 build_hybrid_reasoning_db.py
 ```
 ?? 需要约 2-3 小时
 
@@ -44,7 +44,7 @@ python build_hybrid_reasoning_db.py
 
 或手动启动：
 ```bash
-python web_demo.py
+python3 web_demo.py
 ```
 
 访问：`http://localhost:7201`

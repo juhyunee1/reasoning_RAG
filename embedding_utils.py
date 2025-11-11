@@ -18,7 +18,8 @@ class QwenEmbedder:
         api_key: str,
         model: str = "text-embedding-v4",
         batch_size: int = 25,
-        max_retries: int = 3
+        max_retries: int = 3,
+        dimensions: int = 768  # 自定义向量维度，默认768维
     ):
         """
         初始化 Embedder
@@ -28,11 +29,13 @@ class QwenEmbedder:
             model: embedding 模型名称
             batch_size: 批处理大小
             max_retries: 最大重试次数
+            dimensions: 向量维度 (64~2048)，默认768维
         """
         self.api_key = api_key
         self.model = model
         self.batch_size = batch_size
         self.max_retries = max_retries
+        self.dimensions = dimensions
         
         # 初始化客户端（使用同步客户端）
         self.client = OpenAI(
@@ -53,11 +56,18 @@ class QwenEmbedder:
             embedding 向量
         """
         try:
-            response = self.client.embeddings.create(
-                model=self.model,
-                input=text,
-                encoding_format="float"
-            )
+            # 构建请求参数
+            request_params = {
+                "model": self.model,
+                "input": text,
+                "encoding_format": "float"
+            }
+            
+            # 如果模型支持自定义维度，添加dimensions参数
+            if self.model == "text-embedding-v4" and self.dimensions:
+                request_params["dimensions"] = self.dimensions
+            
+            response = self.client.embeddings.create(**request_params)
             
             # 确保获取实际的 embedding 数据
             embedding_data = response.data[0].embedding
@@ -118,8 +128,13 @@ class QwenEmbedder:
     
     def get_embedding_dimension(self) -> int:
         """获取 embedding 维度"""
+        # 如果指定了维度，直接返回
+        if self.dimensions:
+            return self.dimensions
+        
+        # 否则测试实际维度
         test_embedding = self.embed_single("test")
-        return len(test_embedding) if test_embedding else 1536
+        return len(test_embedding) if test_embedding else 768
 
 
 def prepare_texts_for_embedding(reasoning_chain: Dict) -> Dict[str, str]:

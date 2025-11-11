@@ -46,20 +46,36 @@ Thumbs.db
 
 # Project specific
 chroma_db/
+chroma_db_*/
+test_chroma_db/
+test_chroma_db_*/
 *.log
 *.tmp
 temp/
 logs/
+*.tar.gz
+*.zip
 
 # API keys (security)
 config_local.py
+config*.py
+!config.py
 .env
 .env.local
 
 # Data files (too large for git)
-data/reasoning_chains_fixed_2.jsonl
-data/*.jsonl
-data/*.json
+# Exclude all data directories and files
+data/**/*.jsonl
+data/**/*.json
+data/**/*.txt
+data/**/contents.jsonl
+data/**/metadata.jsonl
+data/**/media.jsonl
+data/**/reasoning_chains.jsonl
+data/**/reasoning_extraction_log.json
+data/**/failed_papers.json
+# Keep data directory structure but ignore contents
+!data/.gitkeep
 
 # Jupyter notebooks
 .ipynb_checkpoints/
@@ -67,3 +83,9 @@ data/*.json
 # Gradio
 gradio_cached_examples/
 flagged/
+
+# Documentation and guides (local only)
+GITHUB_UPLOAD_GUIDE.md
+
+# Reports and temporary files
+report/

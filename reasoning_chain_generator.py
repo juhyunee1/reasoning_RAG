@@ -20,11 +20,12 @@ class ReasoningChainGenerator:
         api_key: str,
         chroma_path: str = "./chroma_db",
         collection_name: str = "neuroscience",
-        generation_model: str = "qwen3-max",
-        temperature: float = 0.7
+        generation_model: str = "qwen3-max", # gemini-2.5-pro
+        temperature: float = 0.3,  # 0.2 ~ 0.4
+        top_p: float = 0.9  # 0.85 ~ 0.95
     ):
-        # 初始化 embedder
-        self.embedder = QwenEmbedder(api_key=api_key)
+        # 初始化 embedder（使用768维，与数据库构建时保持一致）
+        self.embedder = QwenEmbedder(api_key=api_key, dimensions=768)
         
         # 连接到向量数据库
         self.client = chromadb.PersistentClient(path=str(Path(chroma_path)))
@@ -38,6 +39,7 @@ class ReasoningChainGenerator:
         )
         self.generation_model = generation_model
         self.temperature = temperature
+        self.top_p = top_p
         
         print(f"? 推理链生成器已就绪")
         print(f"  向量数据库: {chroma_path}")
@@ -47,7 +49,7 @@ class ReasoningChainGenerator:
     def generate_reasoning_chain(
         self,
         research_question: str,
-        top_k: int = 5,
+        top_k: int = 15,
         return_references: bool = True
     ) -> Dict:
         """
@@ -92,13 +94,26 @@ class ReasoningChainGenerator:
         if asyncio.iscoroutine(generated_chain):
             generated_chain = asyncio.run(generated_chain)
         
-        # 第四步：解析生成结果
-        parsed_chain = self._parse_generated_chain(generated_chain)
+        # 第四步：解析生成结果（包含完整内容和摘要）
+        parsed_result = self._parse_generated_chain(generated_chain)
+        
+        if parsed_result is None:
+            return {
+                'status': 'error',
+                'message': '无法解析生成的推理链',
+                'reasoning_chain': None,
+                'raw_output': generated_chain
+            }
+        
+        # 提取完整内容和摘要
+        reasoning_chain = parsed_result.get('reasoning_chain')
+        summary = parsed_result.get('summary')
         
         result = {
             'status': 'success',
             'research_question': research_question,
-            'reasoning_chain': parsed_chain,
+            'reasoning_chain': reasoning_chain,  # 完整内容
+            'summary': summary,  # 摘要
             'raw_output': generated_chain
         }
 
@@ -147,7 +162,9 @@ class ReasoningChainGenerator:
                 'citation_count': results['metadatas'][0][i]['citation_count'],
                 'similarity': 1 - results['distances'][0][i],
                 'reasoning_chain': reasoning_chain,
-                'full_text': results['documents'][0][i]
+                'full_text': results['documents'][0][i],
+                'authors': results['metadatas'][0][i].get('authors', '[]'),
+                'journal': results['metadatas'][0][i].get('journal', 'Unknown Journal')
             })
         
         return retrieved
@@ -158,31 +175,44 @@ class ReasoningChainGenerator:
         retrieved_chains: List[Dict]
     ) -> str:
         """Build generation prompt"""
-        
+
         # Build reference examples
         examples = []
-        for i, item in enumerate(retrieved_chains[:5], 1):  # Use top 5 most relevant
+        for i, item in enumerate(retrieved_chains[:15], 1):  # Use top 15 most relevant
             chain = item['reasoning_chain']
-            examples.append(f"""
+            
+            # Check if this is an abstract-only entry (SFN abstracts) or full reasoning chain
+            if 'abstract' in chain:
+                # SFN abstract format
+                examples.append(f"""
+Example {i} (Similarity: {item['similarity']:.3f}, Citations: {item['citation_count']}):
+Study: {item['title']} ({item['year']})
+
+Abstract:
+{chain['abstract']}
+""")
+            else:
+                # Full reasoning chain format
+                examples.append(f"""
 Example {i} (Similarity: {item['similarity']:.3f}, Citations: {item['citation_count']}):
 Study: {item['title']} ({item['year']})
 
 Problem Decomposition:
-{chain['problem_decomposition']}
+{chain.get('problem_decomposition', 'N/A')}
 
 Data Requirements:
-{chain['data']}
+{chain.get('data', 'N/A')}
 
 Experimental Methods:
-{chain['method']}
+{chain.get('method', 'N/A')}
 
 Conclusion:
-{chain['conclusion']}
+{chain.get('conclusion', 'N/A')}
 """)
         
         examples_text = "\n".join(examples)
         
-        prompt = f"""You are an expert in neuroscience experimental design. Your task is to generate a complete scientific reasoning chain (quadruple structure) based on the user's research question, referencing similar successful research cases.
+        prompt = f"""You are an expert in neuroscience experimental design. Your task is to generate a mechanistically grounded, hypothesis-driven experimental plan—not a generic description—based on the user's research question and retrieved scientific examples.
 
 User's Research Question:
 {research_question}
@@ -190,79 +220,120 @@ User's Research Question:
 Relevant Research Cases (for reference):
 {examples_text}
 
-Based on the above reference cases, design a complete scientific reasoning chain for the user's research question, including the following four components:
+Each retrieved paper contains a concise scientific reasoning chain with four components:
+- problem_decomposition: background → knowledge gap → hypothesis
+- data: what data are required and why
+- method: how the data are acquired and why these methods fit the question
+- conclusion: expected findings and scientific significance
 
-1. **Problem Decomposition**:
-   - Start from the broad context and progressively focus on specific research hypotheses
-   - Include: background question → mechanistic gap → core hypothesis
-   - Express in a coherent paragraph of 3-5 sentences
+---
 
-2. **Data Requirements**:
-   - Clearly specify what data is needed to test the hypothesis
-   - Include: sample source, data type, sampling characteristics, brain regions, task conditions
-   - Express in a coherent paragraph of 3-4 sentences
+You MUST ensure:
+1) The experimental paradigm is SPECIFIC and WELL-DEFINED  
+   - No naming paradigms without explaining their structure (e.g., not just "fear conditioning"; instead: trial structure, cues, reinforcement schedule, timing logic, behavioral readouts)
 
-3. **Experimental Methods**:
-   - Describe in detail how to design experiments to acquire the data
-   - Include: experimental design, data acquisition methods, experimental conditions, analytical pipeline
-   - Express in a coherent paragraph of 4-5 sentences
+2) Every method directly maps to answering the core hypothesis  
+   - NO method stacking
+   - For each major technique, explicitly state what question it tests and what data it contributes
 
-4. **Conclusion**:
-   - Based on the hypothesis, predict potential findings and their scientific significance
-   - Include: expected findings, how they answer the question, scientific significance
-   - Express in a coherent paragraph of 4-6 sentences
+1. problem_decomposition
+- Begin by identifying what is already known about this biological process or circuit.  
+- Then clearly state what remains unknown or unresolved — highlight the specific gap that the user’s question targets.  
+- Finally, state what this experiment aims to determine or test, i.e., the specific variable, mechanism, or causal link that must be experimentally probed.  
+- Keep focus on what this design needs to solve, not a general field problem.
+- Must explicitly state WHAT mechanistic variable drives the expected behavior/neural state change
 
-**Important Requirements**:
-- Reference the scientific logic and expression style from the examples, but innovate for the user's specific question
-- Ensure logical coherence across the four components: problem → data → method → conclusion
-- Express each component as a natural, fluent paragraph (not bullet points)
-- Output in JSON format
+2. data
+- Sample specifications: species, strain, age range, sex balance, expected sample size rationale, inclusion/exclusion logic
+- Data modalities: neural activity (spiking, LFP, calcium, EEG), behavior metrics, molecular/anatomical markers if relevant
+- Recording characteristics: spatial and temporal resolution, brain regions, timescales, sampling frequency, expected signal quality
+- Task paradigms: Behavioral paradigms, experimental manipulations, control conditions, training protocols
+- Describe the structure of the behavior task
 
-Output Format:
+3. method
+- Experimental logic: Define the independent variable(s), dependent variable(s), and causal contrast, specify how the manipulation directly tests the proposed mechanism
+- Behavior-neural linkage: Explain how neural measurements align with task variables
+- Controls & counterfactuals: Negative / positive controls, counterbalanced group logic, sham conditions, how you rule out confounds (sensory, motor, arousal, learning rate, etc.)
+- Perturbations (if used): Conceptual description of perturbation strategy, state purpose: test necessity / sufficiency / circuit path
+- Analysis reasoning: Core analytic approach (not code), what statistical comparison answers the hypothesis
+- Quality & ethics: Blind conditions, replication, exclusion logic, ethical approvals
+
+4. conclusion
+- Answer to research question: How predicted results directly address the core hypothesis
+- State how these findings resolve the unknown and fill the knowledge gap
+- Summarizes the logical chain: Data -> Method -> Conclusion -> Scientific Findings 
+
+Critical Instructions:
+- NO vague paradigm naming (must describe task logic)
+- Each field should be ONE COMPREHENSIVE PARAGRAPH (not lists, not multiple paragraphs)
+- Write like a PI planning a grant, not a student listing methods
+- Draw methodological insights from the reference cases while innovating for the specific question
+- Use detailed, technical language appropriate for scientific publication
+- No word limits - prioritize completeness and scientific rigor
+- Output in English
+
+Output Format (JSON):
 {{
-    "problem_decomposition": "...",
-    "data": "...",
-    "method": "...",
-    "conclusion": "..."
+    "problem_decomposition": "COMPREHENSIVE detailed paragraph",
+    "problem_summary": "Concise summary (50-100 words)",
+    "data": "COMPREHENSIVE detailed paragraph",
+    "data_summary": "Concise summary (50-100 words)",
+    "method": "COMPREHENSIVE detailed paragraph",
+    "method_summary": "Concise summary (50-100 words)",
+    "conclusion": "COMPREHENSIVE detailed paragraph",
+    "conclusion_summary": "Concise summary (50-100 words)"
 }}
 
-Output only JSON, no other explanations.
+Return ONLY the JSON object with 8 fields, no additional text.
 """
         return prompt
     
     def _call_llm(self, prompt: str) -> str:
-        """Call LLM for generation"""
-        try:
-            response = self.llm_client.chat.completions.create(
-                model=self.generation_model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a neuroscience experimental design expert, skilled at extracting methodological insights from related research and designing new experimental protocols."
-                    },
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=self.temperature,
-                max_tokens=3000
-            )
+        """Call LLM for generation with timeout and retry"""
+        max_retries = 3
+        timeout = 120  
+        
+        for attempt in range(max_retries):
+            try:
+                print(f"? LLM调用尝试 {attempt + 1}/{max_retries}...")
+                response = self.llm_client.chat.completions.create(
+                    model=self.generation_model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "You are a neuroscience experimental design expert, skilled at extracting methodological insights from related research and designing new experimental protocols."
+                        },
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=self.temperature,
+                    top_p=self.top_p,
+                    timeout=timeout  # 设置超时时间
+                )
 
-            print("DEBUG: response type =", type(response))
+                print("DEBUG: response type =", type(response))
 
-            if hasattr(response, "result"):
-                response = response.result
+                if hasattr(response, "result"):
+                    response = response.result
 
-            if hasattr(response, "choices") and len(response.choices) > 0:
-                message_content = response.choices[0].message.content
-                return message_content or "LLM 响应为空"
-            else:
-                return "LLM 响应 choices 为空"
-            
-        except Exception as e:
-            print(f"❌ LLM 调用失败: {str(e)}")
-            return f"Generation failed: {str(e)}"
+                if hasattr(response, "choices") and len(response.choices) > 0:
+                    message_content = response.choices[0].message.content
+                    return message_content or "LLM 响应为空"
+                else:
+                    return "LLM 响应 choices 为空"
+                
+            except Exception as e:
+                print(f"❌ LLM 调用失败 (尝试 {attempt + 1}/{max_retries}): {str(e)}")
+                if attempt == max_retries - 1:
+                    return f"Generation failed after {max_retries} attempts: {str(e)}"
+                else:
+                    print(f"? 等待2秒后重试...")
+                    import time
+                    time.sleep(2)
+        
+        return "Generation failed: Max retries exceeded"
     
     def _parse_generated_chain(self, raw_output: str) -> Optional[Dict]:
-        """解析生成的推理链"""
+        """解析生成的推理链（包含完整内容和摘要）"""
         try:
             # 尝试提取 JSON
             start = raw_output.find('{')
@@ -275,10 +346,30 @@ Output only JSON, no other explanations.
             json_str = raw_output[start:end]
             chain = json.loads(json_str)
             
-            # 验证必需字段
-            required = ['problem_decomposition', 'data', 'method', 'conclusion']
-            if all(k in chain for k in required):
-                return chain
+            # 验证必需字段（8个字段）
+            required_full = ['problem_decomposition', 'data', 'method', 'conclusion']
+            required_summary = ['problem_summary', 'data_summary', 'method_summary', 'conclusion_summary']
+            
+            if all(k in chain for k in required_full) and all(k in chain for k in required_summary):
+                # 分离完整内容和摘要
+                reasoning_chain = {
+                    'problem_decomposition': chain['problem_decomposition'],
+                    'data': chain['data'],
+                    'method': chain['method'],
+                    'conclusion': chain['conclusion']
+                }
+                
+                summary = {
+                    'problem_decomposition': chain['problem_summary'],
+                    'data': chain['data_summary'],
+                    'method': chain['method_summary'],
+                    'conclusion': chain['conclusion_summary']
+                }
+                
+                return {
+                    'reasoning_chain': reasoning_chain,
+                    'summary': summary
+                }
             else:
                 print("? JSON 缺少必需字段")
                 return None
@@ -289,15 +380,41 @@ Output only JSON, no other explanations.
     
     def _format_references(self, retrieved: List[Dict]) -> List[Dict]:
         """格式化参考文献"""
-        return [
-            {
+        formatted_refs = []
+        for item in retrieved:
+            # 解析作者信息
+            authors = []
+            if 'authors' in item and item['authors']:
+                try:
+                    authors_data = json.loads(item['authors']) if isinstance(item['authors'], str) else item['authors']
+                    # 提取作者姓名（处理 [{"name": "作者1"}, {"name": "作者2"}] 格式）
+                    if isinstance(authors_data, list) and len(authors_data) > 0:
+                        if isinstance(authors_data[0], dict) and 'name' in authors_data[0]:
+                            authors = [author['name'] for author in authors_data]
+                        else:
+                            authors = authors_data
+                except:
+                    authors = []
+            
+            # 格式化作者姓名（取前3个作者，超过3个用"等"）
+            if authors:
+                if len(authors) <= 3:
+                    author_str = ', '.join(authors)
+                else:
+                    author_str = ', '.join(authors[:3]) + '等'
+            else:
+                author_str = 'Unknown Authors'
+            
+            formatted_refs.append({
                 'title': item['title'],
                 'year': item['year'],
                 'citation_count': item['citation_count'],
-                'similarity': item['similarity']
-            }
-            for item in retrieved
-        ]
+                'similarity': item['similarity'],
+                'authors': author_str,
+                'journal': item.get('journal', 'Unknown Journal')
+            })
+        
+        return formatted_refs
     
     def print_reasoning_chain(self, chain: Dict, show_references: bool = True):
         """打印推理链（格式化输出）"""
@@ -335,7 +452,7 @@ Output only JSON, no other explanations.
         
         if show_references and 'references' in chain:
             print(f"\n【参考文献】")
-            for i, ref in enumerate(chain['references'][:5], 1):
+            for i, ref in enumerate(chain['references'][:15], 1):
                 print(f"  {i}. {ref['title']} ({ref['year']})")
                 print(f"     相似度: {ref['similarity']:.4f}, 引用数: {ref['citation_count']}")
 
@@ -365,7 +482,7 @@ def main():
         # 生成推理链
         result = generator.generate_reasoning_chain(
             research_question=question,
-            top_k=5,
+            top_k=15,
             return_references=True
         )
         
