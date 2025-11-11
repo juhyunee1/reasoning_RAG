@@ -87,7 +87,7 @@ result = generator.generate_reasoning_chain(
 print(result['reasoning_chain'])
 ```
 
-## ? 项目结构
+## 项目结构
 
 ```
 rag/
